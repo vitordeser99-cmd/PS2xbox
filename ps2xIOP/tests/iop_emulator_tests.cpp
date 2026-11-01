@@ -479,6 +479,44 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset + 0x40u, importTable, sizeof(importTable));
     }
 
+    void writeSio2InterruptIrx(TestHost &host, uint32_t address)
+    {
+        ElfHeader header{};
+        header.ident[0]=0x7F; header.ident[1]='E'; header.ident[2]='L'; header.ident[3]='F';
+        header.ident[4]=1; header.ident[5]=1; header.ident[6]=1;
+        header.type=2; header.machine=8; header.version=1;
+        header.entry=0x10000; header.phoff=sizeof(header); header.ehsize=sizeof(header);
+        header.phentsize=sizeof(ProgramHeader); header.phnum=1;
+        ProgramHeader program{};
+        program.type=1; program.offset=0x100; program.vaddr=program.paddr=0x10000;
+        program.filesz=program.memsz=0x500; program.flags=7; program.align=4;
+        const uint32_t entry[] = {
+            0x27BDFFE0, 0xAFBF001C,
+            0x24040011, 0x24050001, 0x3C060001, 0x34C60200,
+            0x3C070001, 0x34E70400, 0x0C004065, 0, // RegisterIntrHandler at0x10194
+            0x24040011, 0x0C004067, 0, // EnableIntr at0x1019c
+            0x3C08BF80, 0x35088268, 0x240903BD, 0xAD090000,
+            0x8FBF001C, 0x27BD0020, 0x03E00008, 0x00001021,
+        };
+        const uint32_t imports[] = {
+            0x41E00000, 0, 0x101, 0x72746E69, 0x006E616D, // intrman
+            0x03E00008, 0x24000004, 0x03E00008, 0x24000006, 0, 0,
+        };
+        const uint32_t callback[] = {
+            0x8C8A0000, 0, 0x254A0001, 0xAC8A0000, // increment argument counter
+            0x3C08BF80, 0x35088280, 0x24090001, 0xAD090000, // acknowledge SIO2
+            0x2D4A0002, 0x11400005, 0, // rearm only on first invocation
+            0x3C08BF80, 0x35088268, 0x240903BD, 0xAD090000,
+            0x03E00008, 0x24020001,
+        };
+        std::memset(host.guest.data()+address,0,0x600);
+        std::memcpy(host.guest.data()+address,&header,sizeof(header));
+        std::memcpy(host.guest.data()+address+sizeof(header),&program,sizeof(program));
+        std::memcpy(host.guest.data()+address+0x100,entry,sizeof(entry));
+        std::memcpy(host.guest.data()+address+0x280,imports,sizeof(imports));
+        std::memcpy(host.guest.data()+address+0x300,callback,sizeof(callback));
+    }
+
     void writeVblankSchedulingIrx(TestHost &host, uint32_t address)
     {
         constexpr uint32_t codeOffset = 0x100u;
@@ -509,6 +547,10 @@ namespace
         const auto jump = [](uint32_t target) { return 0x08000000u | ((target >> 2u) & 0x03FFFFFFu); };
         const uint32_t entry[] = {
             0x27BDFFE0u, 0xAFBF001Cu,
+            0x24040001u, 0x24050020u, // end phase, priority 32
+            0x3C060001u, 0x34C60240u, // handler 0x10240
+            0x3C070001u, 0x34E70404u, // counter 0x10404
+            jal(waitVblankEndStub + 8u), 0x00000000u,
             0x3C040001u, 0x34840300u, jal(createThreadStub), 0x00000000u,
             0x00408021u, // move s0, v0
             0x3C040001u, 0x34840320u, jal(createThreadStub), 0x00000000u,
@@ -537,6 +579,7 @@ namespace
             0x41E00000u, 0u, 0x00000101u,
             0x616C6276u, 0x00006B6Eu, // "vblank"
             0x03E00008u, 0x24000005u, // WaitVblankEnd
+            0x03E00008u, 0x24000008u, // RegisterVblankHandler
             0u, 0u,
         };
         const uint32_t highDescriptor[] = {0u, 0u, highThreadAddress, 0x400u, 10u};
@@ -552,6 +595,12 @@ namespace
         put(0x140u, lowThread, sizeof(lowThread));
         put(0x180u, thbaseImports, sizeof(thbaseImports));
         put(0x1C0u, vblankImports, sizeof(vblankImports));
+        const uint32_t callback[] = {
+            0x8C880000u, 0x00000000u, // lw t0, 0(a0); load delay
+            0x25080001u, 0xAC880000u, // increment counter
+            0x03E00008u, 0x24020001u, // return 1 to stay registered
+        };
+        put(0x240u, callback, sizeof(callback));
         put(0x300u, highDescriptor, sizeof(highDescriptor));
         put(0x320u, lowDescriptor, sizeof(lowDescriptor));
 
@@ -1033,6 +1082,17 @@ int main()
                 "IOP sceSifSetDma did not copy the payload into EE memory")) return 1;
 
     iop.reset();
+    writeSio2InterruptIrx(host, 0x100u);
+    const auto sio2Module = iop.loadModuleBuffer(0x100u);
+    uint32_t sio2Counter = 0;
+    if (!expect(sio2Module.handled && sio2Module.startResult == 0 &&
+                iop.readMemory(0x10400u, &sio2Counter, sizeof(sio2Counter)) && sio2Counter == 2,
+                "SIO2 completion or handler rearm lost an interrupt")) return 1;
+    iop.runEeCycles(80000u);
+    if (!expect(iop.readMemory(0x10400u, &sio2Counter, sizeof(sio2Counter)) && sio2Counter == 2,
+                "Acknowledged SIO2 completion was delivered again")) return 1;
+
+    iop.reset();
     writeVblankSchedulingIrx(host, 0x100u);
     const ModuleLoadResult vblankModule = iop.loadModuleBuffer(0x100u);
     if (!expect(vblankModule.handled && vblankModule.startResult == 0,
@@ -1050,6 +1110,15 @@ int main()
                 "Could not read the IOP scheduling marker")) return 1;
     if (!expect(lowPriorityMarker == 1u,
                 "WaitVblankEnd returned immediately and starved a lower-priority IOP thread")) return 1;
+
+    iop.runEeCycles(8u * 700000u);
+    uint32_t vblankCount = 0u;
+    if (!expect(iop.readMemory(0x00010404u, &vblankCount, sizeof(vblankCount)) && vblankCount > 0u,
+                "Registered guest VBlank callback did not run through the idle scheduler")) return 1;
+    iop.runEeCycles(8u * 700000u);
+    uint32_t nextVblankCount = 0u;
+    if (!expect(iop.readMemory(0x00010404u, &nextVblankCount, sizeof(nextVblankCount)) && nextVblankCount > vblankCount,
+                "Guest VBlank callback did not remain registered")) return 1;
 
     iop.reset();
     host.logs.clear();

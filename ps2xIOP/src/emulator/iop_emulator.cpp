@@ -105,11 +105,15 @@ namespace ps2x::iop::detail
               heaplib(memory),
               intrman(memory),
               timrman(),
-              ioman(memory),
+              ioman(memory, cdvd),
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports)
         {
+            memory.setControllerAxesReader([this](unsigned port, std::array<uint8_t, 4> &axes)
+            { return host.readControllerAxes(port, axes); });
+            memory.setControllerReader([this](unsigned port, uint16_t &buttons)
+            { return host.readControllerButtons(port, buttons); });
             reset();
         }
 
@@ -123,6 +127,7 @@ namespace ps2x::iop::detail
             cdvd.reset();
             intrman.reset();
             timrman.reset();
+            vblank.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
@@ -133,6 +138,7 @@ namespace ps2x::iop::detail
             eeCycleCarry = 0;
             activeCpu = nullptr;
             lastError.clear();
+            servicingSio2Interrupt = false;
             servicingDmaInterrupts = false;
             servicingGuestCallbacks = false;
             callDepth = 0u;
@@ -406,10 +412,13 @@ namespace ps2x::iop::detail
             {
                 if (!step(cpu))
                     break;
+                serviceSio2Interrupt();
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
                     servicePendingGuestCallbacks();
+                if (memory.interruptControl() != 0u && vblank.nextEventCycle(UINT64_MAX) <= totalCycles)
+                    vblank.serviceDue(totalCycles, *this);
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -481,6 +490,22 @@ namespace ps2x::iop::detail
         }
 
         // Not that good to use exception handling for control flow but will do for now
+        void serviceSio2Interrupt()
+        {
+            constexpr uint32_t mask = 1u << 17u;
+            if (servicingSio2Interrupt || memory.interruptControl() == 0u ||
+                (memory.interruptStatus() & memory.interruptMask() & mask) == 0u ||
+                (memory.read32(0x1F808280u) & 1u) == 0u)
+                return;
+            servicingSio2Interrupt = true;
+            struct Guard { bool &flag; ~Guard() { flag = false; } } guard{servicingSio2Interrupt};
+            // A handler may acknowledge and start another transfer. Consume
+            // this edge before invoking it so that the new edge survives.
+            memory.setInterruptStatus(memory.interruptStatus() & ~mask);
+            if (!intrman.dispatchInterrupt(17, *this))
+                memory.setInterruptStatus(memory.interruptStatus() | mask);
+        }
+
         void servicePendingDmaInterrupts()
         {
             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
@@ -560,9 +585,12 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    serviceSio2Interrupt();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
+                    if (memory.interruptControl() != 0u)
+                        vblank.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -572,6 +600,8 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        if (memory.interruptControl() != 0u)
+                            nextWake = vblank.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -671,6 +701,7 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            memory.releaseModule(it->second.base);
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -704,6 +735,7 @@ namespace ps2x::iop::detail
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
+        bool servicingSio2Interrupt = false;
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
